@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # MySQL数据库服务
+  mysql:
+    image: mysql:8.0
+    container_name: ai-chat-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: yjakgl11
+      MYSQL_DATABASE: ai_chat
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  # Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: ai-chat-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  # 主应用服务
+  app:
+    build: .
+    container_name: ai-chat-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=root
+      - DB_PASSWORD=yjakgl11
+      - DB_NAME=ai_chat
+      - DB_CHARSET=utf8mb4
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - DEBUG=False
+    depends_on:
+      - mysql
+      - redis
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+volumes:
+  mysql_data:
+
+networks:
+  ai-network:
+    driver: bridge
