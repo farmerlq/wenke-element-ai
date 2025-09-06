@@ -5,8 +5,11 @@ Dify平台适配器
 
 import json
 import httpx
+import logging
 from typing import Dict, Any, AsyncGenerator
 from .base_adapter import BaseAIAdapter
+
+logger = logging.getLogger(__name__)
 
 class DifyAdapter(BaseAIAdapter):
     """Dify平台适配器"""
@@ -17,6 +20,80 @@ class DifyAdapter(BaseAIAdapter):
         self.enable_workflow_events = config.get('enable_workflow_events', True)
         # 从配置中提取并存储agent_id
         self.agent_id = config.get('agent_id')
+
+    def clean_json_string(self, json_str: str) -> str:
+        """清理和修复JSON字符串，处理常见的格式问题"""
+        cleaned = json_str.strip()
+        
+        # 处理不完整的Unicode转义序列
+        if '\\u' in cleaned:
+            # 修复content字段的Unicode转义序列问题
+            import re
+            # 修复不完整的content字段 - 处理类似 "content": \\u56de\\u7b54 的情况
+            cleaned = re.sub(r'"content"\s*:\s*([^,\}\]\]]+)(,|\}|\])', 
+                            lambda m: f'"content": "{m.group(1)}"{m.group(2)}' 
+                            if m.group(1) and '\\u' in m.group(1) and not m.group(1).startswith('"') 
+                            else m.group(0), cleaned)
+            
+            # 处理完全没有引号且包含Unicode转义序列的content字段
+            cleaned = re.sub(r'"content"\s*:\s*([^,\}\]\]]*\\u[0-9a-fA-F]{4}[^,\}\]\]]*)(,|\}|\])',
+                            lambda m: f'"content": "{m.group(1)}"{m.group(2)}'
+                            if m.group(1) and not m.group(1).startswith('"') 
+                            else m.group(0), cleaned)
+            
+            # 处理以Unicode转义序列开头但没有引号的情况
+            cleaned = re.sub(r'"content"\s*:\s*(\\u[0-9a-fA-F]{4}[^,\}\]\]]*)(,|\}|\])',
+                            lambda m: f'"content": "{m.group(1)}"{m.group(2)}'
+                            if m.group(1) and not m.group(1).startswith('"')
+                            else m.group(0), cleaned)
+        
+        # 处理node_started事件的title字段问题
+        if '"node_started"' in cleaned and '"title":' in cleaned:
+            import re
+            # 修复title字段没有引号的问题
+            cleaned = re.sub(r'"title"\s*:\s*([^,\}\]\]]+)(,|\}|\])',
+                            lambda m: f'"title": "{m.group(1)}"{m.group(2)}'
+                            if m.group(1) and not m.group(1).startswith('"') and not m.group(1).endswith('"')
+                            else m.group(0), cleaned)
+        
+        # 处理message_id和node_id字段的UUID截断问题
+        if ('"message_id":' in cleaned or '"node_id":' in cleaned) and '"event":' in cleaned and not cleaned.endswith('}'):
+            import re
+            # 检查是否缺少闭合括号
+            open_braces = cleaned.count('{')
+            close_braces = cleaned.count('}')
+            if open_braces > close_braces:
+                cleaned += '}' * (open_braces - close_braces)
+            
+            # 处理UUID截断模式
+            uuid_pattern = r'"(message_id|node_id)"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1,12})"[^"]*'
+            uuid_match = re.search(uuid_pattern, cleaned)
+            if uuid_match and uuid_match.group(2):
+                truncated_uuid = uuid_match.group(2)
+                # 如果UUID被截断（少于36个字符），使用随机字符补全
+                if len(truncated_uuid) < 36:
+                    full_uuid = truncated_uuid.ljust(36, '0')[:36]
+                    cleaned = cleaned.replace(f'"{uuid_match.group(1)}": "{truncated_uuid}"', f'"{uuid_match.group(1)}": "{full_uuid}"')
+        
+        # 检查是否以不完整的对象结尾
+        if cleaned.startswith('{') and not cleaned.endswith('}'):
+            # 如果包含常见字段，尝试补全括号
+            if any(field in cleaned for field in ['"event"', '"message_id"', '"data"', '"content"', '"text"', '"answer"']):
+                cleaned += '}'
+        
+        # 检查是否以不完整的数组结尾
+        if cleaned.startswith('[') and not cleaned.endswith(']'):
+            cleaned += ']'
+            
+        # 处理多个JSON对象拼接的情况
+        if cleaned.count('{') > cleaned.count('}'):
+            # 如果开括号比闭括号多，补全缺失的闭括号
+            cleaned += '}' * (cleaned.count('{') - cleaned.count('}'))
+        elif cleaned.count('[') > cleaned.count(']'):
+            # 如果开方括号比闭方括号多，补全缺失的闭方括号
+            cleaned += ']' * (cleaned.count('[') - cleaned.count(']'))
+            
+        return cleaned
     
     def build_request_headers(self) -> Dict[str, str]:
         """构建Dify请求头"""
@@ -83,11 +160,14 @@ class DifyAdapter(BaseAIAdapter):
         return f"{self.base_url}/{self.agent_key}"
     
     async def parse_stream_response(self, response: httpx.Response) -> AsyncGenerator[str, None]:
-        """解析Dify流式响应 - 确保输出格式符合前端要求且不包含任何额外字符"""
+        """解析Dify流式响应 - 完全处理数据块解析，不再依赖前端DifyRenderer"""
         if response.status_code != 200:
             # 确保错误响应是严格的JSON格式，不包含任何额外字符
             yield json.dumps({"content": f"Dify API调用失败: {response.status_code}", "error": True})
             return
+        
+        # 用于跟踪已发送的内容，避免重复
+        sent_content_set = set()
         
         async for line in response.aiter_lines():
             line = line.strip()
@@ -97,140 +177,169 @@ class DifyAdapter(BaseAIAdapter):
             if line.startswith('data: '):
                 data_content = line[6:].strip()
                 
+                # 调试日志：记录原始数据
+                logger.debug(f"Raw Dify response: {data_content}")
+                
+                # 先尝试清理JSON字符串
+                cleaned_data = self.clean_json_string(data_content)
+                
                 try:
-                    data = json.loads(data_content)
+                    data = json.loads(cleaned_data)
                     
-                    # 专门处理Dify的text_chunk事件 - 主要适用于智能体=1
-                    if data.get('event') == 'text_chunk':
-                        # text_chunk事件处理
-                        if 'text' in data:
-                            text_content = str(data['text'])
-                            # 确保输出是严格的JSON格式
-                            yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                        elif 'data' in data and isinstance(data['data'], dict) and 'text' in data['data']:
-                            # 处理可能嵌套在data中的text_chunk
-                            text_content = str(data['data']['text'])
-                            # 确保输出是严格的JSON格式
-                            yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                    elif data.get('event') == 'message':
-                        # message事件处理
-                        # 首先检查并转发完整的message事件，确保前端能接收到所有工作事件
-                        yield json.dumps({
-                            "event": "message",
-                            "data": data
-                        })
+                    # 调试日志：记录解析后的数据
+                    logger.debug(f"Parsed JSON data: {data}")
+                    
+                    # 提取实际内容（实现前端DifyParser.extractContent的所有逻辑）
+                    extracted_content = self._extract_content(data)
+                    
+                    # 调试日志：记录提取的内容
+                    logger.debug(f"Extracted content: '{extracted_content}', Event: {data.get('event')}")
+                    
+                    if extracted_content:
+                        # 去重逻辑：检查内容是否已经发送过
+                        if extracted_content in sent_content_set:
+                            logger.debug(f"跳过重复内容: '{extracted_content}'")
+                            continue
                         
-                        # 提取answer字段作为内容（某些接口的主要文本内容位置）
-                        if 'answer' in data:
-                            text_content = str(data['answer'])
-                            # 确保输出是严格的JSON格式，同时包含内容和事件信息
-                            yield json.dumps({
-                                "content": text_content,
-                                "event": "message",
-                                "source": "answer",
-                                "delta": {"content": text_content}  # 添加delta.content字段，兼容前端DifyRenderer
-                            })
-                        # 尝试从其他可能的字段中提取内容
-                        elif 'text' in data:
-                            text_content = str(data['text'])
-                            yield json.dumps({
-                                "content": text_content,
-                                "event": "message",
-                                "source": "text",
-                                "delta": {"content": text_content}  # 添加delta.content字段，兼容前端DifyRenderer
-                            })
-                        elif 'data' in data and isinstance(data['data'], dict) and 'text' in data['data']:
-                            text_content = str(data['data']['text'])
-                            yield json.dumps({
-                                "content": text_content,
-                                "event": "message",
-                                "source": "data.text"
-                            })
-                        elif 'outputs' in data and isinstance(data['outputs'], dict) and 'answer' in data['outputs']:
-                            text_content = str(data['outputs']['answer'])
-                            yield json.dumps({
-                                "content": text_content,
-                                "event": "message",
-                                "source": "outputs.answer"
-                            })
-                    # 处理message_end事件
-                    elif data.get('event') == 'message_end':
-                        # 确保输出是严格的JSON格式
+                        # 记录已发送的内容
+                        sent_content_set.add(extracted_content)
+                        
+                        # 对于有效内容，返回标准格式，同时保留原始事件信息
                         yield json.dumps({
-                            "event": "message_end",
+                            "content": extracted_content,
+                            "delta": {"content": extracted_content},
+                            "event": data.get('event'),
                             "data": data.get('data', {})
                         })
-                    # 处理workflow_started事件，以正确的格式发送给前端
-                    elif data.get('event') == 'workflow_started' and self.enable_workflow_events:
-                        # 确保输出是严格的JSON格式
-                        yield json.dumps({
-                            "event": "workflow_started",
+                    elif self.enable_workflow_events:
+                        # 对于工作流事件，返回事件信息，同时包含content字段用于前端显示
+                        event_data = {
+                            "content": "",  # 确保content字段存在
+                            "event": data.get('event'),
                             "data": data.get('data', {})
-                        })
-                    # 处理workflow_finished事件，从中提取文本内容
-                    elif data.get('event') == 'workflow_finished' and 'data' in data:
-                        workflow_data = data['data']
-                        if isinstance(workflow_data, dict) and 'outputs' in workflow_data:
-                            outputs = workflow_data['outputs']
-                            if isinstance(outputs, dict):
-                                # 支持多种可能的输出字段格式
-                                if 'output' in outputs:
-                                    text_content = str(outputs['output'])
-                                    yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                                elif 'answer' in outputs:
-                                    text_content = str(outputs['answer'])
-                                    yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                                elif 'text' in outputs:
-                                    text_content = str(outputs['text'])
-                                    yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                        # 检查其他可能的文本字段路径
-                        elif isinstance(workflow_data, dict) and 'output' in workflow_data:
-                            text_content = str(workflow_data['output'])
-                            yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                    # 通用处理逻辑：优先提取answer字段（某些接口可能会在其他事件中包含）
-                        elif 'answer' in data:
-                            # 对于任何包含answer字段的事件，都提取出来
-                            text_content = str(data['answer'])
-                            # 确保输出是严格的JSON格式
-                            yield json.dumps({
-                                "content": text_content,
-                                "event": data.get('event', 'unknown'),
-                                "source": "answer",
-                                "delta": {"content": text_content}  # 添加delta.content字段，兼容前端DifyRenderer
-                            })
-                    # 检查是否有直接包含文本内容的其他事件类型
-                        elif 'text' in data:
-                            # 对于任何包含text字段的事件，都尝试提取文本内容
-                            text_content = str(data['text'])
-                            # 确保输出是严格的JSON格式
-                            yield json.dumps({"content": text_content, "delta": {"content": text_content}})  # 添加delta.content字段，兼容前端DifyRenderer
-                    else:
-                        # 对于其他事件，以标准格式处理
-                        if self.enable_workflow_events:
-                            # 确保输出是严格的JSON格式，不含任何额外字符
-                            event_data = {
-                                "event": data.get('event', 'unknown'),
-                                "data": data.get('data', {})
-                            }
-                            # 检查是否包含content字段，如果有，则提取出来
-                            if 'content' in data:
-                                event_data['content'] = str(data['content'])
-                                event_data['delta'] = {"content": str(data['content'])}  # 添加delta.content字段，兼容前端DifyRenderer
-                            # 检查是否包含answer字段（智能体2可能会在其他事件中包含）
-                            elif 'answer' in data:
-                                event_data['content'] = str(data['answer'])
-                                event_data['delta'] = {"content": str(data['answer'])}  # 添加delta.content字段，兼容前端DifyRenderer
-                            # 检查是否包含text字段（其他可能的内容字段）
-                            elif 'text' in data:
-                                event_data['content'] = str(data['text'])
-                                event_data['delta'] = {"content": str(data['text'])}  # 添加delta.content字段，兼容前端DifyRenderer
-                            yield json.dumps(event_data)
-                            
+                        }
+                        yield json.dumps(event_data)
+                    
                 except json.JSONDecodeError:
-                    # 如果不是JSON，以标准格式发送内容
+                    # 调试日志：记录JSON解析错误
+                    logger.warning(f"JSON decode error for: {data_content}")
+                    
+                    # 如果不是JSON，尝试直接提取内容
                     if data_content.strip():
-                        # 确保输出是严格的JSON格式，不含任何额外字符
-                        yield json.dumps({"content": data_content, "delta": {"content": data_content}})  # 添加delta.content字段，兼容前端DifyRenderer
+                        # 检查是否为有效内容
+                        if self._is_valid_content(data_content):
+                            # 去重逻辑：检查内容是否已经发送过
+                            if data_content in sent_content_set:
+                                logger.debug(f"跳过重复内容: '{data_content}'")
+                                continue
+                            
+                            # 记录已发送的内容
+                            sent_content_set.add(data_content)
+                            
+                            yield json.dumps({
+                                "content": data_content,
+                                "delta": {"content": data_content}
+                            })
+    
+    def _extract_content(self, data: dict) -> str:
+        """提取实际内容 - 实现前端DifyParser.extractContent的所有逻辑"""
+        if not data or not isinstance(data, dict):
+            return ""
+        
+        # 1. 处理message事件中的顶层answer字段
+        if data.get('event') == 'message' and data.get('answer') and isinstance(data['answer'], str) and data['answer'].strip():
+            return data['answer'].strip()
+        
+        # 2. 处理text_chunk事件中的data.text字段
+        if data.get('event') == 'text_chunk' and data.get('data') and isinstance(data['data'], dict):
+            text = data['data'].get('text')
+            if text and isinstance(text, str) and text.strip() and self._is_valid_content(text):
+                return text.strip()
+        
+        # 3. 处理Dify标准格式的answer字段
+        if data.get('answer') and isinstance(data['answer'], str) and data['answer'].strip():
+            return data['answer'].strip()
+        
+        # 4. 处理delta.content字段 (支持与OpenAI兼容的格式)
+        if data.get('delta') and isinstance(data['delta'], dict):
+            content = data['delta'].get('content')
+            if content and isinstance(content, str) and content.strip() and self._is_valid_content(content):
+                return content.strip()
+        
+        # 5. 处理outputs.answer字段
+        if data.get('outputs') and isinstance(data['outputs'], dict):
+            answer = data['outputs'].get('answer')
+            if answer and isinstance(answer, str) and answer.strip() and self._is_valid_content(answer):
+                return answer.strip()
+        
+        # 6. 处理text字段
+        if data.get('text') and isinstance(data['text'], str) and data['text'].strip() and self._is_valid_content(data['text']):
+            return data['text'].strip()
+        
+        # 7. 处理content字段
+        if data.get('content') and isinstance(data['content'], str) and data['content'].strip() and self._is_valid_content(data['content']):
+            return data['content'].strip()
+        
+        # 8. 处理嵌套数据中的text字段
+        if data.get('data') and isinstance(data['data'], dict):
+            text = data['data'].get('text')
+            if text and isinstance(text, str) and text.strip() and self._is_valid_content(text):
+                return text.strip()
+        
+        # 9. 处理嵌套数据中的content字段
+        if data.get('data') and isinstance(data['data'], dict):
+            content = data['data'].get('content')
+            if content and isinstance(content, str) and content.strip() and self._is_valid_content(content):
+                return content.strip()
+        
+        # 10. 处理OpenAI格式的流式响应
+        if data.get('choices') and isinstance(data['choices'], list) and len(data['choices']) > 0:
+            choice = data['choices'][0]
+            if choice and isinstance(choice, dict) and choice.get('delta') and isinstance(choice['delta'], dict):
+                content = choice['delta'].get('content')
+                if content and isinstance(content, str) and content.strip() and self._is_valid_content(content):
+                    return content.strip()
+        
+        # 11. 处理可能的其他格式
+        if data.get('result') and isinstance(data['result'], str) and data['result'].strip() and self._is_valid_content(data['result']):
+            return data['result'].strip()
+        
+        # 12. 处理tts_message中的audio字段
+        if data.get('event') == 'tts_message' and data.get('audio') and isinstance(data['audio'], str) and data['audio'].strip():
+            return data['audio'].strip()
+        
+        # 13. 处理workflow_finished事件中的输出
+        if data.get('event') == 'workflow_finished' and data.get('data') and isinstance(data['data'], dict):
+            workflow_data = data['data']
+            # 检查outputs字段
+            if workflow_data.get('outputs') and isinstance(workflow_data['outputs'], dict):
+                outputs = workflow_data['outputs']
+                if outputs.get('output') and isinstance(outputs['output'], str) and outputs['output'].strip():
+                    return outputs['output'].strip()
+                elif outputs.get('answer') and isinstance(outputs['answer'], str) and outputs['answer'].strip():
+                    return outputs['answer'].strip()
+                elif outputs.get('text') and isinstance(outputs['text'], str) and outputs['text'].strip():
+                    return outputs['text'].strip()
+            # 检查直接output字段
+            elif workflow_data.get('output') and isinstance(workflow_data['output'], str) and workflow_data['output'].strip():
+                return workflow_data['output'].strip()
+        
+        return ""
+    
+    def _is_valid_content(self, content: str) -> bool:
+        """判断内容是否为有效内容（非元数据）"""
+        if not content or not content.strip():
+            return False
+        
+        # 排除特殊的控制信息标记，但允许[DONE]作为有效事件数据
+        control_markers = ['[DONE]', '[DONE', 'DONE]', 'DONE']
+        for marker in control_markers:
+            if content == marker:
+                return True
+            if marker in content and content != marker:
+                return False
+        
+        return True
     
     async def parse_blocking_response(self, response: httpx.Response) -> str:
         """解析Dify非流式响应"""

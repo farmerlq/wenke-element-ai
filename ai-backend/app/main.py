@@ -3,6 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.db.database import engine, Base
 from app.api import auth, chat, system
 import uvicorn
+import logging
+import sys
+
+# 配置日志
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 # 创建数据库表
 Base.metadata.create_all(bind=engine)
@@ -36,4 +47,4 @@ async def health_check():
     return {"status": "healthy", "service": "ai-chat-backend"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True, log_level="debug")
